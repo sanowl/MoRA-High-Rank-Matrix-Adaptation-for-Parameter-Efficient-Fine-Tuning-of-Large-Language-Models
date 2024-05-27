@@ -1,200 +1,229 @@
-import torch
-import torch.nn as nn
-from typing import Optional, Callable
+import numpy as np
+from typing import Callable, List, Optional, Any
 
-class MoRA(nn.Module):
+from tinygrad.tensor import Tensor
+from tinygrad.nn import LayerNorm, Linear
+
+class MoRA:
     def __init__(self, hidden_size: int, rank: int, group_type: int = 0) -> None:
-        super(MoRA, self).__init__()
-        self.hidden_size = hidden_size
-        self.rank = rank
-        self.matrix = nn.Parameter(torch.zeros(rank, rank))
-        self.group_type = group_type
+        """
+        Initialize MoRA layer.
+        
+        Parameters:
+            hidden_size (int): Size of the hidden layer.
+            rank (int): Rank for MoRA compression.
+            group_type (int): Type of grouping, 0 or 1. Defaults to 0.
+        """
+        self.hidden_size: int = hidden_size
+        self.rank: int = rank
+        self.matrix: Tensor = Tensor.zeros((rank, rank))
+        self.group_type: int = group_type
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        compressed_x = self.compress(x)
-        output = torch.matmul(compressed_x, self.matrix)
-        decompressed_output = self.decompress(output)
+    def __call__(self, x: Tensor) -> Tensor:
+        """
+        Forward pass through MoRA layer.
+        
+        Parameters:
+            x (Tensor): Input tensor.
+            
+        Returns:
+            Tensor: Output tensor after compression and decompression.
+        """
+        compressed_x: Tensor = self.compress(x)
+        output: Tensor = compressed_x @ self.matrix
+        decompressed_output: Tensor = self.decompress(output)
         return decompressed_output
 
-    def compress(self, x: torch.Tensor) -> torch.Tensor:
+    def compress(self, x: Tensor) -> Tensor:
+        """
+        Compress input tensor.
+        
+        Parameters:
+            x (Tensor): Input tensor.
+            
+        Returns:
+            Tensor: Compressed tensor.
+        """
         batch_size, seq_len, _ = x.shape
-        x_padded = torch.cat([x, torch.zeros(batch_size, seq_len, self.hidden_size - x.shape[2], device=x.device)], dim=2)
-        
-        if self.group_type == 0:
-            compressed_x = x_padded.view(batch_size, seq_len, -1, self.rank).sum(dim=2)
-        else:
-            compressed_x = x_padded.view(batch_size, seq_len, self.rank, -1).sum(dim=3)
-        
-        return compressed_x
+        x_padded = np.concatenate([x.data, np.zeros((batch_size, seq_len, self.hidden_size - x.shape[2]))], axis=2)
 
-    def decompress(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-        
         if self.group_type == 0:
-            decompressed_x = x.repeat_interleave(self.hidden_size // self.rank, dim=2)
+            compressed_x = x_padded.reshape(batch_size, seq_len, -1, self.rank).sum(axis=2)
         else:
-            decompressed_x = x.repeat(1, 1, self.hidden_size // self.rank)
+            compressed_x = x_padded.reshape(batch_size, seq_len, self.rank, -1).sum(axis=3)
+
+        return Tensor(compressed_x)
+
+    def decompress(self, x: Tensor) -> Tensor:
+        """
+        Decompress input tensor.
         
+        Parameters:
+            x (Tensor): Input tensor.
+            
+        Returns:
+            Tensor: Decompressed tensor.
+        """
+        batch_size, seq_len, _ = x.shape
+
+        if self.group_type == 0:
+            decompressed_x = np.repeat(x.data, self.hidden_size // self.rank, axis=2)
+        else:
+            decompressed_x = np.tile(x.data, (1, 1, self.hidden_size // self.rank))
+
         decompressed_x = decompressed_x[:, :, :self.hidden_size]
-        
-        return decompressed_x
+
+        return Tensor(decompressed_x)
 
     def change_group_type(self) -> None:
+        """Toggle the group type between 0 and 1."""
         self.group_type = 1 - self.group_type
 
-def apply_mora(model: nn.Module, hidden_size: int, rank: int, merge_steps: int) -> Callable[[int], None]:
-    """
-    Apply MoRA to the linear layers of the model.
-
-    Args:
-        model (nn.Module): The model to apply MoRA to.
-        hidden_size (int): The hidden size of the model.
-        rank (int): The rank of the MoRA matrix.
-        merge_steps (int): The number of steps between merging and resetting.
-
-    Returns:
-        update_model (Callable[[int], None]): A function to update the model at each step.
-    """
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            mora = MoRA(hidden_size, rank)
-            setattr(model, name, nn.Sequential(mora, module))
-
-    def merge_and_reset(model: nn.Module) -> None:
+class MoRALinear:
+    def __init__(self, in_features: int, out_features: int, rank: int, group_type: int = 0, use_bias: bool = True) -> None:
         """
-        Merge the MoRA matrix into the linear layer weights and reset the MoRA matrix.
+        Initialize MoRALinear layer.
+        
+        Parameters:
+            in_features (int): Number of input features.
+            out_features (int): Number of output features.
+            rank (int): Rank for MoRA compression.
+            group_type (int): Type of grouping, 0 or 1. Defaults to 0.
+            use_bias (bool): Whether to use bias. Defaults to True.
         """
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Sequential) and len(module) == 2 and isinstance(module[0], MoRA):
-                mora = module[0]
-                linear = module[1]
-                weight = linear.weight.data
-                
-                if mora.group_type == 0:
-                    weight_merged = weight.view(mora.hidden_size // mora.rank, mora.rank, -1).transpose(0, 1).reshape(mora.hidden_size, -1)
-                else:
-                    weight_merged = weight.view(mora.rank, mora.hidden_size // mora.rank, -1).transpose(0, 1).reshape(mora.hidden_size, -1)
-                
-                linear.weight.data.copy_(weight_merged)
-                mora.matrix.data.zero_()
-                mora.change_group_type()
+        self.in_features: int = in_features
+        self.out_features: int = out_features
+        self.rank: int = rank
+        self.group_type: int = group_type
+        self.use_bias: bool = use_bias
+        self.weight: Tensor = Tensor.uniform(out_features, in_features)
+        self.bias: Optional[Tensor] = Tensor.zeros((out_features,)) if use_bias else None
+        self.mora: MoRA = MoRA(in_features, rank, group_type)
 
-    def reset_optimizer(optimizer: torch.optim.Optimizer) -> None:
+    def __call__(self, x: Tensor) -> Tensor:
         """
-        Reset the learning rate of the optimizer to the initial value.
-        """
-        for group in optimizer.param_groups:
-            group['lr'] = group['initial_lr']
-
-    def update_model(step: int) -> None:
-        """
-        Update the model at each step by merging and resetting if necessary.
-        """
-        if step % merge_steps == 0:
-            merge_and_reset(model)
-            reset_optimizer(optimizer)
-
-    return update_model
-
-class MoRALinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, rank: int, group_type: int = 0, bias: bool = True) -> None:
-        super(MoRALinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        self.group_type = group_type
-        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(out_features))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
-
-        self.mora = MoRA(in_features, rank, group_type)
-
-    def reset_parameters(self) -> None:
-        """
-        Initialize the weight and bias parameters.
-        """
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Perform the forward pass of the MoRALinear layer.
+        Forward pass through MoRALinear layer.
+        
+        Parameters:
+            x (Tensor): Input tensor.
+            
+        Returns:
+            Tensor: Output tensor.
         """
         x = self.mora(x)
-        return nn.functional.linear(x, self.weight, self.bias)
+        output = x @ self.weight.transpose()
+        if self.use_bias:
+            output += self.bias
+        return output
 
     def change_group_type(self) -> None:
-        """
-        Change the group type of the MoRA module.
-        """
+        """Toggle the group type in the MoRA layer."""
         self.mora.change_group_type()
 
     def merge_weights(self) -> None:
-        """
-        Merge the MoRA matrix into the linear layer weights.
-        """
+        """Merge weights based on the current group type."""
         weight = self.weight.data
         if self.mora.group_type == 0:
-            weight_merged = weight.view(self.out_features // self.rank, self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
+            weight_merged = weight.reshape(self.out_features // self.rank, self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
         else:
-            weight_merged = weight.view(self.rank, self.out_features // self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
-        self.weight.data.copy_(weight_merged)
-        self.mora.matrix.data.zero_()
+            weight_merged = weight.reshape(self.rank, self.out_features // self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
+        self.weight = Tensor(weight_merged)
+        self.mora.matrix = Tensor.zeros((self.mora.rank, self.mora.rank))
 
-def apply_mora_linear(model: nn.Module, rank: int, group_type: int = 0) -> None:
+def apply_mora_linear(model: Any) -> None:
     """
-    Replace linear layers with MoRALinear layers in the model.
-
-    Args:
-        model (nn.Module): The model to apply MoRALinear to.
-        rank (int): The rank of the MoRA matrix.
-        group_type (int, optional): The initial group type of the MoRA module. Defaults to 0.
+    Replace Linear layers in a model with MoRALinear layers.
+    
+    Parameters:
+        model: The model whose layers will be modified.
     """
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            mora_linear = MoRALinear(module.in_features, module.out_features, rank, group_type, module.bias is not None)
-            setattr(model, name, mora_linear)
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, Linear):
+            model.layers[i] = MoRALinear(layer.in_features, layer.out_features, rank=128, group_type=0, use_bias=layer.bias is not None)
 
-def merge_and_reset_mora_linear(model: nn.Module) -> None:
+def merge_and_reset_mora_linear(model: Any) -> None:
     """
-    Merge the MoRA matrix into the linear layer weights and reset the MoRA matrix for all MoRALinear layers in the model.
+    Merge weights and reset group types for all MoRALinear layers in a model.
+    
+    Parameters:
+        model: The model whose layers will be modified.
     """
-    for module in model.modules():
-        if isinstance(module, MoRALinear):
-            module.merge_weights()
-            module.change_group_type()
+    for layer in model.layers:
+        if isinstance(layer, MoRALinear):
+            layer.merge_weights()
+            layer.change_group_type()
 
-def update_model_mora_linear(model: nn.Module, optimizer: torch.optim.Optimizer, merge_steps: int) -> Callable[[int], None]:
+def update_model_mora_linear(model: Any, optimizer: Any, merge_steps: int) -> Callable[[int], None]:
     """
-    Create a function to update the model with MoRALinear layers at each step.
-
-    Args:
-        model (nn.Module): The model with MoRALinear layers.
-        optimizer (torch.optim.Optimizer): The optimizer used for training.
-        merge_steps (int): The number of steps between merging and resetting.
-
+    Create a function to update the model at specified steps during training.
+    
+    Parameters:
+        model: The model to be updated.
+        optimizer: The optimizer for training the model.
+        merge_steps (int): Number of steps between weight merges.
+    
     Returns:
-        update_model (Callable[[int], None]): A function to update the model at each step.
+        Callable[[int], None]: The function to be called during training.
     """
-    def reset_optimizer() -> None:
-        """
-        Reset the learning rate of the optimizer to the initial value.
-        """
-        for group in optimizer.param_groups:
-            group['lr'] = group['initial_lr']
-
     def update_model(step: int) -> None:
-        """
-        Update the model at each step by merging and resetting if necessary.
-        """
         if step % merge_steps == 0:
             merge_and_reset_mora_linear(model)
-            reset_optimizer()
+            optimizer.zero_grad()
 
     return update_model
+
+# Example usage
+class YourModel:
+    def __init__(self) -> None:
+        self.layers: List[Any] = [
+            Linear(768, 768),
+            LayerNorm(768),
+            Linear(768, 768),
+            LayerNorm(768),
+            Linear(768, 10),
+        ]
+
+    def __call__(self, x: Tensor) -> Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+# Assuming the existence of an Optimizer class and loss_fn
+class Optimizer:
+    def __init__(self, params: List[Any]) -> None:
+        pass
+    
+    def zero_grad(self) -> None:
+        pass
+    
+    def step(self) -> None:
+        pass
+
+def loss_fn(output: Tensor, target: Tensor) -> Tensor:
+    return Tensor(0.0)  # Placeholder for actual loss computation
+
+model = YourModel()
+apply_mora_linear(model)
+
+optimizer = Optimizer(model.layers)
+merge_steps = 1000
+update_model = update_model_mora_linear(model, optimizer, merge_steps)
+
+# Placeholder for actual input data, target, and number of steps
+input_data = Tensor(np.random.randn(32, 50, 768))
+target = Tensor(np.random.randn(32, 10))
+num_steps = 2000
+
+# Training loop
+for step in range(num_steps):
+    # Forward pass
+    output = model(input_data)
+    loss = loss_fn(output, target)
+
+    # Backward pass
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    # Update model with MoRA
+    update_model(step)
