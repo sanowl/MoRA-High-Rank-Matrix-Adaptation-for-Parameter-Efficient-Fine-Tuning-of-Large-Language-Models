@@ -85,7 +85,7 @@ This project is licensed under the MIT License. See the `LICENSE` file for more 
 
 ## Acknowledgements
 
-MoRA is based on the research paper "MoRA: High-Rank Matrix Adaptation for Parameter-Efficient Fine-Tuning of Large Language Models" by [Author Name(s)].
+MoRA is based on the research paper "MoRA: High-Rank Matrix Adaptation for Parameter-Efficient Fine-Tuning of Large Language Models"
 
 ## Contact
 
