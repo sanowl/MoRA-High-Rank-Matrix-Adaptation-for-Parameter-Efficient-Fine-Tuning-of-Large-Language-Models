@@ -1,9 +1,13 @@
 import numpy as np
 from typing import Callable, List, Optional, Any
+import logging
 
 from tinygrad.tensor import Tensor
-from tinygrad.nn import LayerNorm, Linear
+from tinygrad.nn import LayerNorm, Linear, BatchNorm1d
 from tinygrad.optim import Adam  # Assuming Tinygrad has an Adam optimizer
+from tinygrad.optim.lr_scheduler import ExponentialLR  # Assuming Tinygrad has an LR scheduler
+
+logging.basicConfig(level=logging.INFO)
 
 class MoRA:
     def __init__(self, hidden_size: int, rank: int, group_type: int = 0) -> None:
@@ -30,13 +34,9 @@ class MoRA:
         Returns:
             Tensor: Output tensor after compression and decompression.
         """
-        try:
-            compressed_x = self.compress(x)
-            output = compressed_x @ self.matrix
-            return self.decompress(output)
-        except Exception as e:
-            print(f"Error in MoRA __call__: {e}")
-            raise
+        compressed_x = self.compress(x)
+        output = compressed_x @ self.matrix
+        return self.decompress(output)
 
     def compress(self, x: Tensor) -> Tensor:
         """
@@ -48,19 +48,15 @@ class MoRA:
         Returns:
             Tensor: Compressed tensor.
         """
-        try:
-            batch_size, seq_len, _ = x.shape
-            x_padded = np.concatenate([x.data, np.zeros((batch_size, seq_len, self.hidden_size - x.shape[2]))], axis=2)
+        batch_size, seq_len, _ = x.shape
+        x_padded = np.concatenate([x.data, np.zeros((batch_size, seq_len, self.hidden_size - x.shape[2]))], axis=2)
 
-            if self.group_type == 0:
-                compressed_x = x_padded.reshape(batch_size, seq_len, -1, self.rank).sum(axis=2)
-            else:
-                compressed_x = x_padded.reshape(batch_size, seq_len, self.rank, -1).sum(axis=3)
+        if self.group_type == 0:
+            compressed_x = x_padded.reshape(batch_size, seq_len, -1, self.rank).sum(axis=2)
+        else:
+            compressed_x = x_padded.reshape(batch_size, seq_len, self.rank, -1).sum(axis=3)
 
-            return Tensor(compressed_x)
-        except Exception as e:
-            print(f"Error in MoRA compress: {e}")
-            raise
+        return Tensor(compressed_x)
 
     def decompress(self, x: Tensor) -> Tensor:
         """
@@ -72,20 +68,16 @@ class MoRA:
         Returns:
             Tensor: Decompressed tensor.
         """
-        try:
-            batch_size, seq_len, _ = x.shape
+        batch_size, seq_len, _ = x.shape
 
-            if self.group_type == 0:
-                decompressed_x = np.repeat(x.data, self.hidden_size // self.rank, axis=2)
-            else:
-                decompressed_x = np.tile(x.data, (1, 1, self.hidden_size // self.rank))
+        if self.group_type == 0:
+            decompressed_x = np.repeat(x.data, self.hidden_size // self.rank, axis=2)
+        else:
+            decompressed_x = np.tile(x.data, (1, 1, self.hidden_size // self.rank))
 
-            decompressed_x = decompressed_x[:, :, :self.hidden_size]
+        decompressed_x = decompressed_x[:, :, :self.hidden_size]
 
-            return Tensor(decompressed_x)
-        except Exception as e:
-            print(f"Error in MoRA decompress: {e}")
-            raise
+        return Tensor(decompressed_x)
 
     def change_group_type(self) -> None:
         """Toggle the group type between 0 and 1."""
@@ -122,15 +114,11 @@ class MoRALinear:
         Returns:
             Tensor: Output tensor.
         """
-        try:
-            x = self.mora(x)
-            output = x @ self.weight.transpose()
-            if self.use_bias:
-                output += self.bias
-            return output
-        except Exception as e:
-            print(f"Error in MoRALinear __call__: {e}")
-            raise
+        x = self.mora(x)
+        output = x @ self.weight.transpose()
+        if self.use_bias:
+            output += self.bias
+        return output
 
     def change_group_type(self) -> None:
         """Toggle the group type in the MoRA layer."""
@@ -138,17 +126,13 @@ class MoRALinear:
 
     def merge_weights(self) -> None:
         """Merge weights based on the current group type."""
-        try:
-            weight = self.weight.data
-            if self.mora.group_type == 0:
-                weight_merged = weight.reshape(self.out_features // self.rank, self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
-            else:
-                weight_merged = weight.reshape(self.rank, self.out_features // self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
-            self.weight = Tensor(weight_merged)
-            self.mora.matrix = Tensor.zeros((self.mora.rank, self.mora.rank))
-        except Exception as e:
-            print(f"Error in MoRALinear merge_weights: {e}")
-            raise
+        weight = self.weight.data
+        if self.mora.group_type == 0:
+            weight_merged = weight.reshape(self.out_features // self.rank, self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
+        else:
+            weight_merged = weight.reshape(self.rank, self.out_features // self.rank, -1).transpose(0, 1).reshape(self.out_features, -1)
+        self.weight = Tensor(weight_merged)
+        self.mora.matrix = Tensor.zeros((self.mora.rank, self.mora.rank))
 
 def apply_mora_linear(model: Any) -> None:
     """
@@ -157,13 +141,9 @@ def apply_mora_linear(model: Any) -> None:
     Parameters:
         model: The model whose layers will be modified.
     """
-    try:
-        for i, layer in enumerate(model.layers):
-            if isinstance(layer, Linear):
-                model.layers[i] = MoRALinear(layer.in_features, layer.out_features, rank=128, group_type=0, use_bias=layer.bias is not None)
-    except Exception as e:
-        print(f"Error in apply_mora_linear: {e}")
-        raise
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, Linear):
+            model.layers[i] = MoRALinear(layer.in_features, layer.out_features, rank=128, group_type=0, use_bias=layer.bias is not None)
 
 def merge_and_reset_mora_linear(model: Any) -> None:
     """
@@ -172,14 +152,10 @@ def merge_and_reset_mora_linear(model: Any) -> None:
     Parameters:
         model: The model whose layers will be modified.
     """
-    try:
-        for layer in model.layers:
-            if isinstance(layer, MoRALinear):
-                layer.merge_weights()
-                layer.change_group_type()
-    except Exception as e:
-        print(f"Error in merge_and_reset_mora_linear: {e}")
-        raise
+    for layer in model.layers:
+        if isinstance(layer, MoRALinear):
+            layer.merge_weights()
+            layer.change_group_type()
 
 def update_model_mora_linear(model: Any, optimizer: Any, merge_steps: int) -> Callable[[int], None]:
     """
@@ -205,9 +181,9 @@ class YourModel:
     def __init__(self) -> None:
         self.layers: List[Any] = [
             Linear(768, 768),
-            LayerNorm(768),
+            BatchNorm1d(768),
             Linear(768, 768),
-            LayerNorm(768),
+            BatchNorm1d(768),
             Linear(768, 10),
         ]
 
@@ -219,14 +195,15 @@ class YourModel:
 # Assuming the existence of an Optimizer class and loss_fn
 class Optimizer:
     def __init__(self, params: List[Any]) -> None:
-        self.params = params
         self.optim = Adam(params, lr=0.001)  # Using Adam optimizer
+        self.scheduler = ExponentialLR(self.optim, gamma=0.99)  # Learning rate scheduler
 
     def zero_grad(self) -> None:
         self.optim.zero_grad()
     
     def step(self) -> None:
         self.optim.step()
+        self.scheduler.step()  # Step the learning rate scheduler
 
 def loss_fn(output: Tensor, target: Tensor) -> Tensor:
     return ((output - target) ** 2).mean()  # Mean squared error loss
@@ -255,8 +232,16 @@ for step in range(num_steps):
         loss.backward()
         optimizer.step()
 
+        # Gradient clipping
+        for p in optimizer.optim.param_groups[0]['params']:
+            if p.grad is not None:
+                p.grad.clip_(-1, 1)
+
         # Update model with MoRA
         update_model(step)
+
+        if step % 100 == 0:
+            logging.info(f'Step {step}, Loss: {loss.data}')
     except Exception as e:
-        print(f"Error during training step {step}: {e}")
+        logging.error(f"Error during training step {step}: {e}")
         raise
