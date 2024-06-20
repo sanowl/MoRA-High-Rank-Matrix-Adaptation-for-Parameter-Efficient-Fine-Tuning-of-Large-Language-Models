@@ -1,159 +1,243 @@
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
-from flax.training import train_state
-import optax
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import codecs
 import logging
+import os
+import re
+import shutil
+import subprocess
+from functools import partial
+from os.path import abspath, dirname, exists, isdir, join
+from pathlib import Path
+from typing import List, Optional
 
-logging.basicConfig(level=logging.INFO)
+from setuptools import Command
+from setuptools.command import build_py, develop, sdist
 
-class MoRA(nn.Module):
-    hidden_size: int
-    rank: int
-    group_type: int = 0
+log = logging.getLogger(__name__)
 
-    def setup(self):
-        self.matrix = self.param('matrix', jax.random.uniform, (self.rank, self.rank))
-
-    def __call__(self, x):
-        compressed_x = self.compress(x)
-        output = jnp.dot(compressed_x, self.matrix)
-        return self.decompress(output)
-
-    def compress(self, x):
-        batch_size, seq_len, hidden_size = x.shape
-        x_padded = jnp.pad(x, ((0, 0), (0, 0), (0, self.hidden_size - hidden_size)))
-
-        if self.group_type == 0:
-            compressed_x = x_padded.reshape(batch_size, seq_len, -1, self.rank).sum(axis=2)
-        else:
-            compressed_x = x_padded.reshape(batch_size, seq_len, self.rank, -1).sum(axis=3)
-
-        return compressed_x
-
-    def decompress(self, x):
-        batch_size, seq_len, rank_size = x.shape
-
-        if self.group_type == 0:
-            decompressed_x = jnp.repeat(x, self.hidden_size // self.rank, axis=2)
-        else:
-            decompressed_x = jnp.tile(x, (1, 1, self.hidden_size // self.rank))
-
-        decompressed_x = decompressed_x[:, :, :self.hidden_size]
-
-        return decompressed_x
-
-    def change_group_type(self):
-        self.group_type = 1 - self.group_type
-
-class MoRALinear(nn.Module):
-    in_features: int
-    out_features: int
-    rank: int
-    group_type: int = 0
-    use_bias: bool = True
-
-    def setup(self):
-        self.weight = self.param('weight', jax.random.uniform, (self.out_features, self.in_features))
-        self.bias = self.param('bias', jax.random.zeros, (self.out_features,)) if self.use_bias else None
-        self.mora = MoRA(self.in_features, self.rank, self.group_type)
-
-    def __call__(self, x):
-        x = self.mora(x)
-        output = jnp.dot(x, self.weight.T)
-        if self.use_bias:
-            output += self.bias
-        return output
-
-    def change_group_type(self):
-        self.mora.change_group_type()
-
-    def merge_weights(self):
-        weight = self.weight
-        if self.mora.group_type == 0:
-            weight_merged = weight.reshape(self.out_features // self.rank, self.rank, -1).transpose(1, 0, 2).reshape(self.out_features, -1)
-        else:
-            weight_merged = weight.reshape(self.rank, self.out_features // self.rank, -1).transpose(1, 0, 2).reshape(self.out_features, -1)
-        self.weight = weight_merged
-        self.mora.matrix = jax.random.uniform(jax.random.PRNGKey(0), (self.mora.rank, self.mora.rank))
-
-def apply_mora_linear(model):
-    for attr_name in dir(model):
-        attr = getattr(model, attr_name)
-        if isinstance(attr, nn.Dense):
-            setattr(model, attr_name, MoRALinear(attr.features, attr.kernel.shape[0], rank=128, group_type=0, use_bias=attr.bias is not None))
-
-def merge_and_reset_mora_linear(model):
-    for attr_name in dir(model):
-        attr = getattr(model, attr_name)
-        if isinstance(attr, MoRALinear):
-            attr.merge_weights()
-            attr.change_group_type()
-
-def update_model_mora_linear(state, model, step, merge_steps):
-    if step % merge_steps == 0:
-        merge_and_reset_mora_linear(model)
-        state = state.replace(apply_fn=model.apply, params=model.init(jax.random.PRNGKey(0), jnp.ones((1, 10))).unfreeze())
-
-    return state
-
-class YourModel(nn.Module):
-    def setup(self):
-        self.dense1 = nn.Dense(768)
-        self.bn1 = nn.BatchNorm(use_running_average=True)
-        self.dense2 = nn.Dense(768)
-        self.bn2 = nn.BatchNorm(use_running_average=True)
-        self.dense3 = nn.Dense(10)
-
-    def __call__(self, x):
-        x = self.dense1(x)
-        x = self.bn1(x)
-        x = self.dense2(x)
-        x = self.bn2(x)
-        x = self.dense3(x)
-        return x
-
-def create_train_state(rng, model, learning_rate):
-    params = model.init(rng, jnp.ones((1, 50, 768)))['params']
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate),
-        optax.exponential_decay(learning_rate, transition_steps=100, decay_rate=0.99)
-    )
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-
-@jax.jit
-def train_step(state, batch, target):
-    def loss_fn(params):
-        logits = state.apply_fn({'params': params}, batch)
-        loss = jnp.mean((logits - target) ** 2)
-        return loss
-
-    grads = jax.grad(loss_fn)(state.params)
-    state = state.apply_gradients(grads=grads)
-    return state
-
-# Initialize and apply MoRA to the model
-model = YourModel()
-apply_mora_linear(model)
-
-# Create train state
-rng = jax.random.PRNGKey(0)
-state = create_train_state(rng, model, learning_rate=0.001)
-merge_steps = 1000
-num_steps = 2000
-input_data = jnp.random.randn(32, 50, 768)
-target = jnp.random.randn(32, 10)
-
-# Training loop
-for step in range(num_steps):
+def find_version(*file_paths: str) -> str:
+    """Retrieve the version string from the specified file."""
+    version_file_path = os.path.join(*file_paths)
     try:
-        state = train_step(state, input_data, target)
-        state = update_model_mora_linear(state, model, step, merge_steps)
+        with codecs.open(version_file_path, "r", "utf-8") as file:
+            content = file.read()
+    except FileNotFoundError:
+        raise RuntimeError(f"Version file not found: {version_file_path}")
+    
+    match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]", content, re.M)
+    if match:
+        return match.group(1)
+    raise RuntimeError(f"Unable to find version string in {version_file_path}.")
 
-        if step % 100 == 0:
-            loss = jnp.mean((state.apply_fn({'params': state.params}, input_data) - target) ** 2)
-            logging.info(f'Step {step}, Loss: {loss}')
+def matches(patterns: List[str], string: str) -> bool:
+    """Check if the string matches any of the given regex patterns."""
+    string = string.replace("\\", "/")
+    return any(re.match(pattern, string) for pattern in patterns)
+
+def find_files(
+    root: str,
+    rbase: str,
+    include_files: List[str],
+    include_dirs: List[str],
+    excludes: List[str],
+    scan_exclude: List[str],
+) -> List[str]:
+    """Recursively find files and directories matching the given patterns."""
+    files = []
+    scan_root = os.path.join(root, rbase)
+    with os.scandir(scan_root) as it:
+        for entry in it:
+            path = os.path.join(rbase, entry.name)
+            if matches(scan_exclude, path):
+                continue
+
+            if entry.is_dir():
+                if matches(include_dirs, path):
+                    if not matches(excludes, path):
+                        files.append(path)
+                else:
+                    files.extend(find_files(
+                        root=root,
+                        rbase=path,
+                        include_files=include_files,
+                        include_dirs=include_dirs,
+                        excludes=excludes,
+                        scan_exclude=scan_exclude,
+                    ))
+            elif matches(include_files, path) and not matches(excludes, path):
+                files.append(path)
+
+    return files
+
+def find(
+    root: str,
+    include_files: List[str],
+    include_dirs: List[str],
+    excludes: List[str],
+    scan_exclude: Optional[List[str]] = None,
+) -> List[str]:
+    """Find all files and directories matching the given patterns starting from the root."""
+    scan_exclude = scan_exclude or []
+    return find_files(
+        root=root,
+        rbase="",
+        include_files=include_files,
+        include_dirs=include_dirs,
+        excludes=excludes,
+        scan_exclude=scan_exclude,
+    )
+
+def safe_remove(file_path: str) -> None:
+    """Safely remove a file or directory."""
+    try:
+        if isdir(file_path):
+            shutil.rmtree(file_path, ignore_errors=True)
+        else:
+            os.unlink(file_path)
+        log.info(f"Removed: {file_path}")
     except Exception as e:
-        logging.error(f"Error during training step {step}: {e}")
+        log.error(f"Failed to remove {file_path}: {e}")
+
+class CleanCommand(Command):
+    """Custom command to clean out generated and junk files."""
+
+    description = "Cleans out generated and junk files we don't want in the repo"
+    user_options: List[str] = []
+
+    def run(self) -> None:
+        files = find(
+            ".",
+            include_files=["^hydra/grammar/gen/.*"],
+            include_dirs=[
+                "\\.egg-info$",
+                "^.pytest_cache$",
+                ".*/__pycache__$",
+                ".*/multirun$",
+                ".*/outputs$",
+                "^build$",
+            ],
+            scan_exclude=["^.git$", "^.nox/.*$", "^website/.*$"],
+            excludes=[".*\\.gitignore$"],
+        )
+
+        if self.dry_run:
+            print("Would clean up the following files and dirs:")
+            print("\n".join(files))
+        else:
+            for file_path in files:
+                if exists(file_path):
+                    safe_remove(file_path)
+
+    def initialize_options(self) -> None:
+        pass
+
+    def finalize_options(self) -> None:
+        pass
+
+def run_antlr(cmd: Command) -> None:
+    """Execute the ANTLR command to generate parsers."""
+    try:
+        log.info("Generating parsers with antlr4")
+        cmd.run_command("antlr")
+    except OSError as e:
+        if e.errno == os.errno.ENOENT:
+            msg = f"Unable to generate parsers: {e}"
+            log.critical(f"{'=' * len(msg)}\n{msg}\n{'=' * len(msg)}")
+            exit(1)
         raise
+
+class BuildPyCommand(build_py.build_py):
+    """Custom build_py command to clean and generate parsers before building."""
+
+    def run(self) -> None:
+        if not self.dry_run:
+            self.run_command("clean")
+            run_antlr(self)
+        super().run()
+
+class DevelopCommand(develop.develop):
+    """Custom develop command to generate parsers before development."""
+
+    def run(self) -> None:
+        if not self.dry_run:
+            run_antlr(self)
+        super().run()
+
+class SDistCommand(sdist.sdist):
+    """Custom sdist command to clean and generate parsers before creating source distribution."""
+
+    def run(self) -> None:
+        if not self.dry_run:
+            self.run_command("clean")
+            run_antlr(self)
+        super().run()
+
+class ANTLRCommand(Command):
+    """Generate parsers using ANTLR."""
+
+    description = "Run ANTLR"
+    user_options: List[str] = []
+
+    def run(self) -> None:
+        """Run the ANTLR command to generate parsers."""
+        root_dir = abspath(dirname(__file__))
+        project_root = abspath(join(root_dir, ".."))
+        grammars = [
+            "hydra/grammar/OverrideLexer.g4",
+            "hydra/grammar/OverrideParser.g4",
+        ]
+        for grammar in grammars:
+            command = [
+                "java",
+                "-jar",
+                join(root_dir, "bin/antlr-4.11.1-complete.jar"),
+                "-Dlanguage=Python3",
+                "-o",
+                join(project_root, "hydra/grammar/gen/"),
+                "-Xexact-output-dir",
+                "-visitor",
+                join(project_root, grammar),
+            ]
+
+            log.info(f"Generating parser for Python3: {command}")
+
+            subprocess.check_call(command)
+            log.info("Replacing imports of antlr4 in generated parsers")
+            self._fix_imports()
+
+    def initialize_options(self) -> None:
+        pass
+
+    def finalize_options(self) -> None:
+        pass
+
+    def _fix_imports(self) -> None:
+        """Fix imports in the generated parsers to use the vendored antlr4."""
+        build_dir = Path(__file__).parent.absolute()
+        project_root = build_dir.parent
+        lib = "antlr4"
+        pkgname = 'omegaconf.vendor'
+
+        replacements = [
+            partial(
+                re.compile(rf'(^\s*)import {lib}\n', flags=re.M).sub,
+                rf'\1from {pkgname} import {lib}\n'
+            ),
+            partial(
+                re.compile(rf'(^\s*)from {lib}(\.|\s+)', flags=re.M).sub,
+                rf'\1from {pkgname}.{lib}\2'
+            ),
+        ]
+
+        gen_path = project_root / "hydra" / "grammar" / "gen"
+        for item in gen_path.iterdir():
+            if item.is_file() and item.suffix == ".py":
+                text = item.read_text('utf-8')
+                for replacement in replacements:
+                    text = replacement(text)
+                item.write_text(text, 'utf-8')
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    log.info("Setup script for project build and clean operations.")
+
