@@ -1,243 +1,235 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-import codecs
-import logging
-import os
-import re
-import shutil
-import subprocess
-from functools import partial
-from os.path import abspath, dirname, exists, isdir, join
-from pathlib import Path
-from typing import List, Optional
+import math
+from typing import Dict, List, Optional, Tuple, Union
 
-from setuptools import Command
-from setuptools.command import build_py, develop, sdist
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import _LRScheduler
+from torch.utils.data import DataLoader, TensorDataset
 
-log = logging.getLogger(__name__)
+class MoRALayer(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        r: int,
+        lora_alpha: float = 1.0,
+        lora_dropout: float = 0.0,
+        merge_weights: bool = True,
+    ):
+        super().__init__()
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.merge_weights = merge_weights
 
-def find_version(*file_paths: str) -> str:
-    """Retrieve the version string from the specified file."""
-    version_file_path = os.path.join(*file_paths)
-    try:
-        with codecs.open(version_file_path, "r", "utf-8") as file:
-            content = file.read()
-    except FileNotFoundError:
-        raise RuntimeError(f"Version file not found: {version_file_path}")
-    
-    match = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]", content, re.M)
-    if match:
-        return match.group(1)
-    raise RuntimeError(f"Unable to find version string in {version_file_path}.")
+        self.lora_A = nn.Parameter(torch.zeros(r, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+        self.scaling = self.lora_alpha / self.r
 
-def matches(patterns: List[str], string: str) -> bool:
-    """Check if the string matches any of the given regex patterns."""
-    string = string.replace("\\", "/")
-    return any(re.match(pattern, string) for pattern in patterns)
+        self.lora_dropout = nn.Dropout(p=lora_dropout)
+        
+        # Adaptive rank
+        self.adaptive_rank = nn.Parameter(torch.ones(1))
+        
+        # Initialize weights
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
 
-def find_files(
-    root: str,
-    rbase: str,
-    include_files: List[str],
-    include_dirs: List[str],
-    excludes: List[str],
-    scan_exclude: List[str],
-) -> List[str]:
-    """Recursively find files and directories matching the given patterns."""
-    files = []
-    scan_root = os.path.join(root, rbase)
-    with os.scandir(scan_root) as it:
-        for entry in it:
-            path = os.path.join(rbase, entry.name)
-            if matches(scan_exclude, path):
-                continue
-
-            if entry.is_dir():
-                if matches(include_dirs, path):
-                    if not matches(excludes, path):
-                        files.append(path)
-                else:
-                    files.extend(find_files(
-                        root=root,
-                        rbase=path,
-                        include_files=include_files,
-                        include_dirs=include_dirs,
-                        excludes=excludes,
-                        scan_exclude=scan_exclude,
-                    ))
-            elif matches(include_files, path) and not matches(excludes, path):
-                files.append(path)
-
-    return files
-
-def find(
-    root: str,
-    include_files: List[str],
-    include_dirs: List[str],
-    excludes: List[str],
-    scan_exclude: Optional[List[str]] = None,
-) -> List[str]:
-    """Find all files and directories matching the given patterns starting from the root."""
-    scan_exclude = scan_exclude or []
-    return find_files(
-        root=root,
-        rbase="",
-        include_files=include_files,
-        include_dirs=include_dirs,
-        excludes=excludes,
-        scan_exclude=scan_exclude,
-    )
-
-def safe_remove(file_path: str) -> None:
-    """Safely remove a file or directory."""
-    try:
-        if isdir(file_path):
-            shutil.rmtree(file_path, ignore_errors=True)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            effective_rank = torch.clamp(self.adaptive_rank, min=1, max=self.r)
+            lora_A = self.lora_A[:int(effective_rank), :]
+            lora_B = self.lora_B[:, :int(effective_rank)]
         else:
-            os.unlink(file_path)
-        log.info(f"Removed: {file_path}")
-    except Exception as e:
-        log.error(f"Failed to remove {file_path}: {e}")
+            lora_A = self.lora_A
+            lora_B = self.lora_B
+        
+        result = (self.lora_dropout(x) @ lora_A.t() @ lora_B.t()) * self.scaling
+        return result
 
-class CleanCommand(Command):
-    """Custom command to clean out generated and junk files."""
-
-    description = "Cleans out generated and junk files we don't want in the repo"
-    user_options: List[str] = []
-
-    def run(self) -> None:
-        files = find(
-            ".",
-            include_files=["^hydra/grammar/gen/.*"],
-            include_dirs=[
-                "\\.egg-info$",
-                "^.pytest_cache$",
-                ".*/__pycache__$",
-                ".*/multirun$",
-                ".*/outputs$",
-                "^build$",
-            ],
-            scan_exclude=["^.git$", "^.nox/.*$", "^website/.*$"],
-            excludes=[".*\\.gitignore$"],
+class MoRALinear(nn.Linear):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        r: int = 8,
+        lora_alpha: float = 1.0,
+        lora_dropout: float = 0.0,
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        self.mora = MoRALayer(
+            in_features,
+            out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            merge_weights=merge_weights,
         )
 
-        if self.dry_run:
-            print("Would clean up the following files and dirs:")
-            print("\n".join(files))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight, self.bias) + self.mora(x)
+
+class MoRAModel(nn.Module):
+    def __init__(self, base_model: nn.Module, mora_config: Dict[str, Union[int, float, bool]]):
+        super().__init__()
+        self.base_model = base_model
+        self.mora_config = mora_config
+        self._replace_linear_layers()
+
+    def _replace_linear_layers(self):
+        for name, module in self.base_model.named_modules():
+            if isinstance(module, nn.Linear):
+                parent_name = '.'.join(name.split('.')[:-1])
+                child_name = name.split('.')[-1]
+                parent = self.base_model if parent_name == '' else getattr(self.base_model, parent_name)
+                setattr(
+                    parent,
+                    child_name,
+                    MoRALinear(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                        **self.mora_config
+                    )
+                )
+
+    def forward(self, *args, **kwargs):
+        return self.base_model(*args, **kwargs)
+
+class MoRAOptimizer(Optimizer):
+    def __init__(
+        self,
+        params: List[torch.Tensor],
+        lr: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0,
+    ):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    def step(self, closure: Optional[callable] = None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+
+                state['step'] += 1
+
+                if group['weight_decay'] != 0:
+                    grad = grad.add(p.data, alpha=group['weight_decay'])
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                denom = exp_avg_sq.sqrt().add_(group['eps'])
+
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
+
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+class MoRAScheduler(_LRScheduler):
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warmup_steps: int,
+        total_steps: int,
+        min_lr: float = 1e-5,
+        last_epoch: int = -1,
+    ):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            return [base_lr * (self.last_epoch / self.warmup_steps) for base_lr in self.base_lrs]
         else:
-            for file_path in files:
-                if exists(file_path):
-                    safe_remove(file_path)
+            progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            return [max(self.min_lr, base_lr * (1 - progress)) for base_lr in self.base_lrs]
 
-    def initialize_options(self) -> None:
-        pass
+def apply_mora(
+    model: nn.Module,
+    r: int = 8,
+    lora_alpha: float = 1.0,
+    lora_dropout: float = 0.0,
+    merge_weights: bool = True,
+) -> MoRAModel:
+    mora_config = {
+        'r': r,
+        'lora_alpha': lora_alpha,
+        'lora_dropout': lora_dropout,
+        'merge_weights': merge_weights,
+    }
+    return MoRAModel(model, mora_config)
 
-    def finalize_options(self) -> None:
-        pass
+# Example usage
+def main():
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def run_antlr(cmd: Command) -> None:
-    """Execute the ANTLR command to generate parsers."""
-    try:
-        log.info("Generating parsers with antlr4")
-        cmd.run_command("antlr")
-    except OSError as e:
-        if e.errno == os.errno.ENOENT:
-            msg = f"Unable to generate parsers: {e}"
-            log.critical(f"{'=' * len(msg)}\n{msg}\n{'=' * len(msg)}")
-            exit(1)
-        raise
+    # Create a base model (e.g., a transformer)
+    base_model = nn.TransformerEncoderLayer(d_model=512, nhead=8).to(device)
+    
+    # Apply MoRA to the base model
+    mora_model = apply_mora(base_model, r=16, lora_alpha=32, lora_dropout=0.1).to(device)
+    
+    # Create optimizer and scheduler
+    optimizer = MoRAOptimizer(mora_model.parameters(), lr=1e-3, weight_decay=0.01)
+    scheduler = MoRAScheduler(optimizer, warmup_steps=1000, total_steps=10000, min_lr=1e-5)
+    
+    # Define loss function
+    criterion = nn.MSELoss()
 
-class BuildPyCommand(build_py.build_py):
-    """Custom build_py command to clean and generate parsers before building."""
-
-    def run(self) -> None:
-        if not self.dry_run:
-            self.run_command("clean")
-            run_antlr(self)
-        super().run()
-
-class DevelopCommand(develop.develop):
-    """Custom develop command to generate parsers before development."""
-
-    def run(self) -> None:
-        if not self.dry_run:
-            run_antlr(self)
-        super().run()
-
-class SDistCommand(sdist.sdist):
-    """Custom sdist command to clean and generate parsers before creating source distribution."""
-
-    def run(self) -> None:
-        if not self.dry_run:
-            self.run_command("clean")
-            run_antlr(self)
-        super().run()
-
-class ANTLRCommand(Command):
-    """Generate parsers using ANTLR."""
-
-    description = "Run ANTLR"
-    user_options: List[str] = []
-
-    def run(self) -> None:
-        """Run the ANTLR command to generate parsers."""
-        root_dir = abspath(dirname(__file__))
-        project_root = abspath(join(root_dir, ".."))
-        grammars = [
-            "hydra/grammar/OverrideLexer.g4",
-            "hydra/grammar/OverrideParser.g4",
-        ]
-        for grammar in grammars:
-            command = [
-                "java",
-                "-jar",
-                join(root_dir, "bin/antlr-4.11.1-complete.jar"),
-                "-Dlanguage=Python3",
-                "-o",
-                join(project_root, "hydra/grammar/gen/"),
-                "-Xexact-output-dir",
-                "-visitor",
-                join(project_root, grammar),
-            ]
-
-            log.info(f"Generating parser for Python3: {command}")
-
-            subprocess.check_call(command)
-            log.info("Replacing imports of antlr4 in generated parsers")
-            self._fix_imports()
-
-    def initialize_options(self) -> None:
-        pass
-
-    def finalize_options(self) -> None:
-        pass
-
-    def _fix_imports(self) -> None:
-        """Fix imports in the generated parsers to use the vendored antlr4."""
-        build_dir = Path(__file__).parent.absolute()
-        project_root = build_dir.parent
-        lib = "antlr4"
-        pkgname = 'omegaconf.vendor'
-
-        replacements = [
-            partial(
-                re.compile(rf'(^\s*)import {lib}\n', flags=re.M).sub,
-                rf'\1from {pkgname} import {lib}\n'
-            ),
-            partial(
-                re.compile(rf'(^\s*)from {lib}(\.|\s+)', flags=re.M).sub,
-                rf'\1from {pkgname}.{lib}\2'
-            ),
-        ]
-
-        gen_path = project_root / "hydra" / "grammar" / "gen"
-        for item in gen_path.iterdir():
-            if item.is_file() and item.suffix == ".py":
-                text = item.read_text('utf-8')
-                for replacement in replacements:
-                    text = replacement(text)
-                item.write_text(text, 'utf-8')
+    # Create dummy dataset and dataloader
+    input_data = torch.randn(1000, 10, 512).to(device)
+    target_data = torch.randn(1000, 10, 512).to(device)
+    dataset = TensorDataset(input_data, target_data)
+    data_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    
+    # Training loop
+    num_epochs = 10
+    for epoch in range(num_epochs):
+        mora_model.train()
+        total_loss = 0
+        for batch in data_loader:
+            inputs, targets = batch
+            outputs = mora_model(inputs)
+            loss = criterion(outputs, targets)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(data_loader)
+        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
+    
+    print("Training complete!")
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    log.info("Setup script for project build and clean operations.")
-
+    main()
