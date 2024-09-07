@@ -98,7 +98,7 @@ MoRA is designed for high-performance fine-tuning on large-scale models and data
 
 ## **Contributing**
 
-We welcome contributions! If you would like to contribute to MoRA, feel free to submit a pull request or open an issue for discussion.
+ If you would like to contribute to MoRA, feel free to submit a pull request or open an issue for discussion.
 
 
 
