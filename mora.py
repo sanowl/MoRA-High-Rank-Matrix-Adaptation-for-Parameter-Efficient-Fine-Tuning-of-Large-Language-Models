@@ -1,82 +1,151 @@
 import math
+import logging
 from typing import Dict, List, Optional, Tuple, Union
+import yaml
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
+from transformers import PreTrainedModel, PreTrainedTokenizer, BertModel, BertTokenizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class Config:
+    def __init__(self, config_path: str):
+        with open(config_path, 'r') as file:
+            self.config = yaml.safe_load(file)
+        self.validate_config()
+
+    def __getattr__(self, name):
+        return self.config.get(name, None)
+
+    def validate_config(self):
+        required_params = ['lr', 'num_epochs', 'base_model_name', 'num_experts', 'expert_hidden_size']
+        for param in required_params:
+            if param not in self.config:
+                raise ValueError(f"{param} is required in the configuration file")
+        logger.info(f"Loaded configuration: {self.config}")
+
+    def get_optimizer_params(self):
+        return self.config.get('optimizer_params', {})
+
+class DynamicExpert(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, output_size)
+        self.act = nn.ReLU()
+
+    def forward(self, x):
+        x = self.act(self.fc1(x))
+        return self.fc2(x)
+
+class SparseMoE(nn.Module):
+    def __init__(self, num_experts, input_size, hidden_size, output_size, k=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.k = k
+        self.experts = nn.ModuleList([DynamicExpert(input_size, hidden_size, output_size) for _ in range(num_experts)])
+        self.gate = nn.Linear(input_size, num_experts)
+
+    def forward(self, x):
+        gate_logits = self.gate(x)
+        weights, indices = torch.topk(gate_logits, self.k, dim=-1)
+        weights = F.softmax(weights, dim=-1)
+        
+        expert_outputs = []
+        for i in range(self.k):
+            expert_output = torch.stack([self.experts[j](x[i]) for i, j in enumerate(indices[:, i])])
+            expert_outputs.append(expert_output)
+        
+        expert_outputs = torch.stack(expert_outputs, dim=1)
+        output = torch.sum(weights.unsqueeze(-1) * expert_outputs, dim=1)
+        return output
+
+class AdaptiveComputationTime(nn.Module):
+    def __init__(self, input_size, hidden_size, max_steps):
+        super().__init__()
+        self.max_steps = max_steps
+        self.rnn = nn.LSTMCell(input_size, hidden_size)
+        self.halting = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        h, c = torch.zeros(batch_size, self.rnn.hidden_size).to(x.device), torch.zeros(batch_size, self.rnn.hidden_size).to(x.device)
+        halting_probability = torch.zeros(batch_size, 1).to(x.device)
+        remainders = torch.zeros(batch_size, 1).to(x.device)
+        n_updates = torch.zeros(batch_size, 1).to(x.device)
+        outputs = []
+
+        for _ in range(self.max_steps):
+            h, c = self.rnn(x, (h, c))
+            y = torch.sigmoid(self.halting(h))
+            halting_probability += y * (1 - halting_probability)
+            remainders += (1 - halting_probability)
+            n_updates += 1.0
+            outputs.append(h.unsqueeze(1))
+            
+            if halting_probability.min() > 1 - 0.01:
+                break
+
+        outputs = torch.cat(outputs, dim=1)
+        avg_outputs = torch.sum(outputs * remainders.unsqueeze(-1), dim=1) / n_updates
+        return avg_outputs, halting_probability, n_updates
+
+class HierarchicalExperts(nn.Module):
+    def __init__(self, num_levels, num_experts_per_level, input_size, hidden_size, output_size):
+        super().__init__()
+        self.levels = nn.ModuleList([
+            SparseMoE(num_experts_per_level, input_size if i == 0 else hidden_size, hidden_size, output_size if i == num_levels-1 else hidden_size)
+            for i in range(num_levels)
+        ])
+
+    def forward(self, x):
+        for level in self.levels:
+            x = level(x)
+        return x
 
 class MoRALayer(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        r: int,
-        lora_alpha: float = 1.0,
-        lora_dropout: float = 0.0,
-        merge_weights: bool = True,
-    ):
+    def __init__(self, config: Config):
         super().__init__()
-        self.r = r
-        self.lora_alpha = lora_alpha
-        self.merge_weights = merge_weights
-
-        self.lora_A = nn.Parameter(torch.zeros(r, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
-        self.scaling = self.lora_alpha / self.r
-
-        self.lora_dropout = nn.Dropout(p=lora_dropout)
-        
-        # Adaptive rank
-        self.adaptive_rank = nn.Parameter(torch.ones(1))
-        
-        # Initialize weights
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
+        self.hierarchical_experts = HierarchicalExperts(
+            config.num_levels, 
+            config.num_experts_per_level, 
+            config.in_features, 
+            config.expert_hidden_size, 
+            config.out_features
+        )
+        self.act = AdaptiveComputationTime(config.in_features, config.expert_hidden_size, config.max_act_steps)
+        self.layer_norm = nn.LayerNorm(config.out_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            effective_rank = torch.clamp(self.adaptive_rank, min=1, max=self.r)
-            lora_A = self.lora_A[:int(effective_rank), :]
-            lora_B = self.lora_B[:, :int(effective_rank)]
-        else:
-            lora_A = self.lora_A
-            lora_B = self.lora_B
-        
-        result = (self.lora_dropout(x) @ lora_A.t() @ lora_B.t()) * self.scaling
-        return result
+        x, halting_prob, n_updates = self.act(x)
+        x = self.hierarchical_experts(x)
+        return self.layer_norm(x)
 
 class MoRALinear(nn.Linear):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        r: int = 8,
-        lora_alpha: float = 1.0,
-        lora_dropout: float = 0.0,
-        merge_weights: bool = True,
-        **kwargs
-    ):
-        nn.Linear.__init__(self, in_features, out_features, **kwargs)
-        self.mora = MoRALayer(
-            in_features,
-            out_features,
-            r=r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            merge_weights=merge_weights,
-        )
+    def __init__(self, config: Config):
+        nn.Linear.__init__(self, config.in_features, config.out_features, bias=config.use_bias)
+        self.mora = MoRALayer(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, self.weight, self.bias) + self.mora(x)
 
 class MoRAModel(nn.Module):
-    def __init__(self, base_model: nn.Module, mora_config: Dict[str, Union[int, float, bool]]):
+    def __init__(self, base_model: PreTrainedModel, config: Config):
         super().__init__()
         self.base_model = base_model
-        self.mora_config = mora_config
+        self.config = config
         self._replace_linear_layers()
 
     def _replace_linear_layers(self):
@@ -88,148 +157,361 @@ class MoRAModel(nn.Module):
                 setattr(
                     parent,
                     child_name,
-                    MoRALinear(
-                        module.in_features,
-                        module.out_features,
-                        bias=module.bias is not None,
-                        **self.mora_config
-                    )
+                    MoRALinear(self.config)
                 )
 
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)
 
-class MoRAOptimizer(Optimizer):
-    def __init__(
-        self,
-        params: List[torch.Tensor],
-        lr: float = 1e-3,
-        betas: Tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 0,
-    ):
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+class LARS(Optimizer):
+    def __init__(self, params, lr=1e-3, momentum=0.9, weight_decay=0, trust_coefficient=0.001):
+        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, trust_coefficient=trust_coefficient)
         super().__init__(params, defaults)
 
-    def step(self, closure: Optional[callable] = None):
+    @torch.no_grad()
+    def step(self, closure=None):
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
-                grad = p.grad.data
+
+                dp = p.grad
                 state = self.state[p]
 
                 if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    state['momentum'] = torch.zeros_like(p.data)
 
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
+                momentum = state['momentum']
+                weight_norm = torch.norm(p.data)
+                grad_norm = torch.norm(dp)
 
-                state['step'] += 1
+                if weight_norm > 0 and grad_norm > 0:
+                    local_lr = group['lr'] * group['trust_coefficient'] * weight_norm / grad_norm
+                else:
+                    local_lr = group['lr']
 
                 if group['weight_decay'] != 0:
-                    grad = grad.add(p.data, alpha=group['weight_decay'])
+                    dp = dp.add(p.data, alpha=group['weight_decay'])
 
-                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-
-                denom = exp_avg_sq.sqrt().add_(group['eps'])
-
-                bias_correction1 = 1 - beta1 ** state['step']
-                bias_correction2 = 1 - beta2 ** state['step']
-                step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
-
-                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+                momentum.mul_(group['momentum']).add_(dp, alpha=local_lr)
+                p.data.add_(momentum, alpha=-1)
 
         return loss
 
+class SAM(torch.optim.Optimizer):
+    def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+
+        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
+        super(SAM, self).__init__(params, defaults)
+
+        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+
+            for p in group["params"]:
+                if p.grad is None: continue
+                e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale.to(p)
+                p.add_(e_w)  # climb to the local maximum "w + e(w)"
+                self.state[p]["e_w"] = e_w
+
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None: continue
+                p.sub_(self.state[p]["e_w"])  # get back to "w" from "w + e(w)"
+
+        self.base_optimizer.step()  # do the actual "sharpness-aware" update
+
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        assert closure is not None, "Sharpness Aware Minimization requires closure, but it was not provided"
+        closure = torch.enable_grad()(closure)  # the closure should do a full forward-backward pass
+
+        self.first_step(zero_grad=True)
+        closure()
+        self.second_step()
+
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]["params"][0].device  # put everything on the same device, in case of model parallelism
+        norm = torch.norm(
+                    torch.stack([
+                        ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(shared_device)
+                        for group in self.param_groups for p in group["params"]
+                        if p.grad is not None
+                    ]),
+                    p=2
+               )
+        return norm
+
 class MoRAScheduler(_LRScheduler):
-    def __init__(
-        self,
-        optimizer: Optimizer,
-        warmup_steps: int,
-        total_steps: int,
-        min_lr: float = 1e-5,
-        last_epoch: int = -1,
-    ):
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.min_lr = min_lr
-        super().__init__(optimizer, last_epoch)
+    def __init__(self, optimizer: Optimizer, config: Config):
+        self.warmup_steps = config.warmup_steps
+        self.total_steps = config.total_steps
+        self.min_lr = config.min_lr
+        self.cycle_length = config.cycle_length
+        self.cycle_mult = config.cycle_mult
+        super().__init__(optimizer)
 
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
             return [base_lr * (self.last_epoch / self.warmup_steps) for base_lr in self.base_lrs]
         else:
             progress = (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps)
-            return [max(self.min_lr, base_lr * (1 - progress)) for base_lr in self.base_lrs]
+            cycle = math.floor(1 + progress * self.total_steps / self.cycle_length)
+            x = abs(progress * self.total_steps / self.cycle_length - cycle + 1)
+            cycle_factor = max(0, (1 - x) * self.cycle_mult ** (cycle - 1))
+            return [max(self.min_lr, base_lr * (1 - progress) * cycle_factor) for base_lr in self.base_lrs]
 
-def apply_mora(
-    model: nn.Module,
-    r: int = 8,
-    lora_alpha: float = 1.0,
-    lora_dropout: float = 0.0,
-    merge_weights: bool = True,
-) -> MoRAModel:
-    mora_config = {
-        'r': r,
-        'lora_alpha': lora_alpha,
-        'lora_dropout': lora_dropout,
-        'merge_weights': merge_weights,
+def apply_mora(model: PreTrainedModel, config: Config) -> MoRAModel:
+    return MoRAModel(model, config)
+
+class TextClassificationHead(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.classifier_dropout)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+
+    def forward(self, features):
+        x = self.dropout(features)
+        x = self.dense(x)
+        x = torch.tanh(x)
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x
+
+class MoRAForSequenceClassification(nn.Module):
+    def __init__(self, mora_model: MoRAModel, config: Config):
+        super().__init__()
+        self.mora_model = mora_model
+        self.classifier = TextClassificationHead(config)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.mora_model(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs[1]
+        logits = self.classifier(pooled_output)
+        return logits
+
+class AdvancedDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer: PreTrainedTokenizer, config: Config):
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = config.max_length
+        self.encodings = self.tokenizer(texts, truncation=True, padding=True, max_length=self.max_length)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx])
+        return item
+
+def compute_metrics(preds, labels):
+    preds = preds.argmax(axis=1)
+    acc = accuracy_score(labels, preds)
+    precision = precision_score(labels, preds, average='weighted')
+    recall = recall_score(labels, preds, average='weighted')
+    f1 = f1_score(labels, preds, average='weighted')
+    cm = confusion_matrix(labels, preds)
+    return {
+        'accuracy': acc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'confusion_matrix': cm.tolist()
     }
-    return MoRAModel(model, mora_config)
 
-# Example usage
+def train_step(model, batch, optimizer, scheduler, scaler, device, config):
+    model.train()
+    batch = {k: v.to(device) for k, v in batch.items()}
+    
+    with autocast(enabled=config.use_mixed_precision):
+        outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+        loss = F.cross_entropy(outputs, batch['labels'])
+
+    scaler.scale(loss).backward()
+    
+    if config.use_sam:
+        optimizer.first_step(zero_grad=True)
+        with autocast(enabled=config.use_mixed_precision):
+            outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            loss = F.cross_entropy(outputs, batch['labels'])
+        scaler.scale(loss).backward()
+        optimizer.second_step(zero_grad=True)
+    else:
+        scaler.unscale_(optimizer)
+        if config.use_gradient_clipping:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+
+    scheduler.step()
+
+    return loss.item()
+
+def eval_step(model, batch, device):
+    model.eval()
+    batch = {k: v.to(device) for k, v in batch.items()}
+    
+    with torch.no_grad():
+        outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+        loss = F.cross_entropy(outputs, batch['labels'])
+    
+    return loss.item(), outputs.cpu().numpy(), batch['labels'].cpu().numpy()
+
+def train(model, train_dataloader, val_dataloader, optimizer, scheduler, scaler, device, config):
+    best_val_loss = float('inf')
+    early_stopping_counter = 0
+    
+    for epoch in range(config.num_epochs):
+        model.train()
+        total_loss = 0
+        for step, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{config.num_epochs}")):
+            loss = train_step(model, batch, optimizer, scheduler, scaler, device, config)
+            total_loss += loss
+
+            if step % config.logging_steps == 0:
+                logger.info(f"Epoch {epoch + 1}/{config.num_epochs} - Step {step} - Loss: {loss:.4f}")
+
+            if step % config.eval_steps == 0:
+                val_loss, val_metrics = evaluate(model, val_dataloader, device, config)
+                logger.info(f"Validation Loss: {val_loss:.4f}")
+                logger.info(f"Validation Metrics: {val_metrics}")
+
+                if val_loss < best_val_loss - config.min_delta:
+                    best_val_loss = val_loss
+                    torch.save(model.state_dict(), config.best_model_path)
+                    logger.info("New best model saved!")
+                    early_stopping_counter = 0
+                else:
+                    early_stopping_counter += 1
+
+                if early_stopping_counter >= config.early_stopping_patience:
+                    logger.info("Early stopping triggered.")
+                    return
+
+            if step % config.checkpoint_interval == 0:
+                torch.save(model.state_dict(), f"{config.checkpoint_path}_step_{step}.pth")
+
+        avg_train_loss = total_loss / len(train_dataloader)
+        logger.info(f"Epoch {epoch + 1}/{config.num_epochs} - Average train loss: {avg_train_loss:.4f}")
+
+        if config.save_every_epoch:
+            torch.save(model.state_dict(), f"{config.model_path}_epoch_{epoch + 1}.pth")
+
+    logger.info("Training completed.")
+
+def evaluate(model, dataloader, device, config):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            loss, preds, labels = eval_step(model, batch, device)
+            total_loss += loss
+            all_preds.extend(preds)
+            all_labels.extend(labels)
+
+    avg_loss = total_loss / len(dataloader)
+    metrics = compute_metrics(np.array(all_preds), np.array(all_labels))
+
+    return avg_loss, metrics
+
+def create_data_loaders(dataset, config):
+    indices = list(range(len(dataset)))
+    np.random.shuffle(indices)
+    split = int(np.floor(config.val_size * len(dataset)))
+    
+    train_indices, val_indices = indices[split:], indices[:split]
+    
+    train_sampler = SubsetRandomSampler(train_indices)
+    val_sampler = SubsetRandomSampler(val_indices)
+    
+    train_loader = DataLoader(dataset, sampler=train_sampler, batch_size=config.train_batch_size, num_workers=config.num_workers)
+    val_loader = DataLoader(dataset, sampler=val_sampler, batch_size=config.eval_batch_size, num_workers=config.num_workers)
+    
+    return train_loader, val_loader
+
+def initialize_optimizer(model, config):
+    if config.optimizer == "AdamW":
+        optimizer = torch.optim.AdamW(model.parameters(), **config.get_optimizer_params())
+    elif config.optimizer == "LARS":
+        optimizer = LARS(model.parameters(), **config.get_optimizer_params())
+    else:
+        raise ValueError(f"Unsupported optimizer: {config.optimizer}")
+    
+    if config.use_sam:
+        optimizer = SAM(model.parameters(), optimizer, **config.get_sam_params())
+    
+    return optimizer
+
+def initialize_scheduler(optimizer, config):
+    return MoRAScheduler(optimizer, config)
+
 def main():
+    # Load configuration
+    config = Config('config.yaml')
+
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_mixed_precision = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 7
+    config.use_mixed_precision = use_mixed_precision
 
-    # Create a base model (e.g., a transformer)
-    base_model = nn.TransformerEncoderLayer(d_model=512, nhead=8).to(device)
-    
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+
+    # Load pre-trained model and tokenizer
+    base_model = BertModel.from_pretrained(config.base_model_name)
+    tokenizer = BertTokenizer.from_pretrained(config.base_model_name)
+
     # Apply MoRA to the base model
-    mora_model = apply_mora(base_model, r=16, lora_alpha=32, lora_dropout=0.1).to(device)
-    
-    # Create optimizer and scheduler
-    optimizer = MoRAOptimizer(mora_model.parameters(), lr=1e-3, weight_decay=0.01)
-    scheduler = MoRAScheduler(optimizer, warmup_steps=1000, total_steps=10000, min_lr=1e-5)
-    
-    # Define loss function
-    criterion = nn.MSELoss()
+    mora_model = apply_mora(base_model, config)
 
-    # Create dummy dataset and dataloader
-    input_data = torch.randn(1000, 10, 512).to(device)
-    target_data = torch.randn(1000, 10, 512).to(device)
-    dataset = TensorDataset(input_data, target_data)
-    data_loader = DataLoader(dataset, batch_size=32, shuffle=True)
-    
-    # Training loop
-    num_epochs = 10
-    for epoch in range(num_epochs):
-        mora_model.train()
-        total_loss = 0
-        for batch in data_loader:
-            inputs, targets = batch
-            outputs = mora_model(inputs)
-            loss = criterion(outputs, targets)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(data_loader)
-        print(f"Epoch {epoch+1}/{num_epochs}, Average Loss: {avg_loss:.4f}")
-    
-    print("Training complete!")
+    # Create the classification model
+    model = MoRAForSequenceClassification(mora_model, config).to(device)
+
+    # Prepare dataset (replace with your actual dataset loading logic)
+    texts, labels = load_dataset(config.dataset_path)
+    dataset = AdvancedDataset(texts, labels, tokenizer, config)
+
+    # Create data loaders
+    train_dataloader, val_dataloader = create_data_loaders(dataset, config)
+
+    # Initialize optimizer and scheduler
+    optimizer = initialize_optimizer(model, config)
+    scheduler = initialize_scheduler(optimizer, config)
+
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler(enabled=config.use_mixed_precision)
+
+    # Train the model
+    train(model, train_dataloader, val_dataloader, optimizer, scheduler, scaler, device, config)
+
+    # Load best model and evaluate
+    model.load_state_dict(torch.load(config.best_model_path))
+    test_loss, test_metrics = evaluate(model, val_dataloader, device, config)
+    logger.info(f"Test Loss: {test_loss:.4f}")
+    logger.info(f"Test Metrics: {test_metrics}")
 
 if __name__ == "__main__":
     main()
