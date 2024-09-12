@@ -1,0 +1,81 @@
+# config.yaml
+
+defaults:
+  - augmentation: default
+  - optimizer: radam
+  - scheduler: cosine_annealing
+  - model: bert_moex
+  - dataset: csv
+
+seed: 42
+
+dataset:
+  path: "./data/dataset.csv"
+  format: "csv"
+  text_column: "text"
+  label_column: "label"
+  num_labels: 2
+  max_length: 512
+
+augmentation:
+  use_augmentation: true
+  techniques:
+    - synonym_replacement
+    - random_insertion
+    - random_swap
+    - random_deletion
+  aug_ratio: 0.15
+
+model:
+  base_model_name: "bert-base-uncased"
+  num_levels: 3
+  num_experts_per_level: 8
+  expert_hidden_size: 512
+  in_features: 768
+  out_features: 768
+  max_act_steps: 20
+  classifier_dropout: 0.3
+
+optimizer:
+  type: "RAdam"  # Options: AdamW, RAdam, LARS, etc.
+  lr: 3e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "CosineAnnealingWarmRestarts"  # Options: OneCycle, CosineAnnealing, etc.
+  T_0: 10
+  T_mult: 2
+  eta_min: 1e-6
+
+training:
+  num_epochs: 5
+  train_batch_size: 32
+  eval_batch_size: 64
+  accumulation_steps: 4
+  use_mixed_precision: true
+  use_gradient_clipping: true
+  max_grad_norm: 1.0
+  val_size: 0.1
+  num_workers: 8
+  logging_steps: 50
+  eval_steps: 200
+  checkpoint_interval: 1000
+  checkpoint_path: "./checkpoints/model"
+  best_model_path: "./checkpoints/best_model.ckpt"
+  early_stopping_patience: 5
+  min_delta: 0.001
+  save_every_epoch: true
+
+hyperparameters:
+  use_optuna: true
+  n_trials: 50
+  direction: "maximize"
+
+wandb:
+  project: "Advanced-MoRA-Sequence-Classification"
+  entity: "your_wandb_entity"
+  mode: "online"  # Options: online, offline
+
+ray:
+  address: "auto"  # Use Ray's autoscaler
