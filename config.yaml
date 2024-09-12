@@ -1,81 +1,53 @@
 # config.yaml
-
-defaults:
-  - augmentation: default
-  - optimizer: radam
-  - scheduler: cosine_annealing
-  - model: bert_moex
-  - dataset: csv
-
+num_epochs: 10
+train_batch_size: 32
+eval_batch_size: 64
+learning_rate: 2e-5
+optimizer: "AdamW"
+optimizer_params:
+  lr: 2e-5
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+scheduler: "OneCycleLR"
+scheduler_params:
+  max_lr: 2e-5
+  total_steps: 10000
+  anneal_strategy: "cos"
+  pct_start: 0.3
+  div_factor: 25.0
+  final_div_factor: 1e4
+weight_decay: 0.01
+max_grad_norm: 1.0
+early_stopping_patience: 3
+gradient_accumulation_steps: 1
+mixed_precision: true
 seed: 42
 
-dataset:
-  path: "./data/dataset.csv"
-  format: "csv"
-  text_column: "text"
-  label_column: "label"
-  num_labels: 2
-  max_length: 512
-
-augmentation:
-  use_augmentation: true
-  techniques:
-    - synonym_replacement
-    - random_insertion
-    - random_swap
-    - random_deletion
-  aug_ratio: 0.15
-
-model:
-  base_model_name: "bert-base-uncased"
-  num_levels: 3
-  num_experts_per_level: 8
-  expert_hidden_size: 512
+base_model_name: "bert-base-uncased"
+num_labels: 2
+classifier_dropout: 0.1
+mora:
+  num_levels: 2
+  num_experts_per_level: 4
+  expert_hidden_size: 256
   in_features: 768
   out_features: 768
-  max_act_steps: 20
-  classifier_dropout: 0.3
+  max_act_steps: 10
 
-optimizer:
-  type: "RAdam"  # Options: AdamW, RAdam, LARS, etc.
-  lr: 3e-5
-  weight_decay: 0.01
-  betas: [0.9, 0.999]
+dataset_path: "./data/dataset.csv"
+max_length: 128
+val_size: 0.1
+num_workers: 4
 
-scheduler:
-  type: "CosineAnnealingWarmRestarts"  # Options: OneCycle, CosineAnnealing, etc.
-  T_0: 10
-  T_mult: 2
-  eta_min: 1e-6
+checkpoint_dir: "./checkpoints"
+best_model_name: "best_model.pth"
+checkpoint_interval: 500
+save_every_epoch: true
 
-training:
-  num_epochs: 5
-  train_batch_size: 32
-  eval_batch_size: 64
-  accumulation_steps: 4
-  use_mixed_precision: true
-  use_gradient_clipping: true
-  max_grad_norm: 1.0
-  val_size: 0.1
-  num_workers: 8
-  logging_steps: 50
-  eval_steps: 200
-  checkpoint_interval: 1000
-  checkpoint_path: "./checkpoints/model"
-  best_model_path: "./checkpoints/best_model.ckpt"
-  early_stopping_patience: 5
-  min_delta: 0.001
-  save_every_epoch: true
+logging_steps: 50
+eval_steps: 200
 
-hyperparameters:
-  use_optuna: true
-  n_trials: 50
-  direction: "maximize"
-
-wandb:
-  project: "Advanced-MoRA-Sequence-Classification"
-  entity: "your_wandb_entity"
-  mode: "online"  # Options: online, offline
-
-ray:
-  address: "auto"  # Use Ray's autoscaler
+use_sam: false
+sam_params:
+  rho: 0.05
+  adaptive: false
