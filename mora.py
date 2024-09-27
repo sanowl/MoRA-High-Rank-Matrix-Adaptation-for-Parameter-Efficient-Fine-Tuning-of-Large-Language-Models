@@ -25,10 +25,10 @@ from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 from pydantic import BaseModel, Field, validator
 from typing import Optional, Dict, Any, Tuple
-import random
 import os
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
+import secrets
 
 # Set up logging
 logging.basicConfig(
@@ -123,7 +123,7 @@ def set_seed(seed: int):
     """
     Set seed for reproducibility.
     """
-    random.seed(seed)
+    secrets.SystemRandom().seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
